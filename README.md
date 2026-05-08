@@ -5,7 +5,7 @@ Python-based internet speed monitor for WSL/Linux.
 The script runs an internet speed test, saves the results to a CSV file, and generates an HTML report with an interactive graph.
 
 ## Project Structure
-
+```
 internet-speed-monitor/
 ├── src/
 │   └── internet_speed_monitor.py
@@ -21,6 +21,7 @@ internet-speed-monitor/
 ├── cron_example.txt
 ├── README.md
 └── .gitignore
+```
 
 ## Features
 
