@@ -1,0 +1,12 @@
+speed-monitor-venv/
+__pycache__/
+*.pyc
+*.pyo
+
+logs/
+Outputs/
+
+.env
+.DS_Store
+.vscode/
+.idea/

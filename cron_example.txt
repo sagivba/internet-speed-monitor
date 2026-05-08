@@ -1,0 +1,7 @@
+# Internet Speed Monitor - cron examples
+
+# Run every 30 minutes:
+*/30 * * * * /home/sagivba-adm/src/internet-speed-monitor/run_speed_test.sh >> /home/sagivba-adm/src/internet-speed-monitor/logs/cron.log 2>&1
+
+# Temporary test - run every minute:
+# * * * * * /home/sagivba-adm/src/internet-speed-monitor/run_speed_test.sh >> /home/sagivba-adm/src/internet-speed-monitor/logs/cron.log 2>&1
