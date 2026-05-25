@@ -4,7 +4,7 @@ import argparse
 import csv
 import html
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +21,12 @@ DEFAULT_HTML_FILE = "Outputs/internet_speed_report.html"
 MIN_DOWNLOAD_MBPS = 100.0
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_RETRY_SLEEP_SECONDS = 10
+
+DEFAULT_RECENT_HOURS = 24
+DEFAULT_ALERT_MIN_DOWNLOAD = 150.0
+DEFAULT_ALERT_CONSECUTIVE_LOW = 6
+DEFAULT_ALERT_ACTIVE_START = 7
+DEFAULT_ALERT_ACTIVE_END = 23
 
 CSV_COLUMNS = [
     "timestamp",
@@ -268,11 +274,87 @@ def build_download_stats(ok_df: pd.DataFrame) -> dict[str, str]:
     }
 
 
-def generate_html_report(csv_file: Path, html_file: Path) -> None:
+def filter_last_hours(ok_df: pd.DataFrame, hours: int) -> pd.DataFrame:
+    if ok_df.empty or "timestamp" not in ok_df.columns:
+        return ok_df.copy()
+
+    cutoff_time = datetime.now() - timedelta(hours=hours)
+    return ok_df[ok_df["timestamp"] >= cutoff_time].copy()
+
+
+def count_download_below_threshold(
+    ok_df: pd.DataFrame,
+    threshold_mbps: float,
+) -> int:
+    if ok_df.empty or "download_mbps" not in ok_df.columns:
+        return 0
+
+    download_series = pd.to_numeric(ok_df["download_mbps"], errors="coerce")
+    return int((download_series < threshold_mbps).sum())
+
+
+def calculate_low_download_streaks(
+    ok_df: pd.DataFrame,
+    threshold_mbps: float,
+    active_start_hour: int = DEFAULT_ALERT_ACTIVE_START,
+    active_end_hour: int = DEFAULT_ALERT_ACTIVE_END,
+) -> dict[str, int]:
+    if ok_df.empty or "timestamp" not in ok_df.columns or "download_mbps" not in ok_df.columns:
+        return {
+            "current_streak": 0,
+            "max_streak": 0,
+        }
+
+    sorted_df = ok_df.sort_values("timestamp", ascending=True).copy()
+    current_streak = 0
+    max_streak = 0
+
+    for _, row in sorted_df.iterrows():
+        timestamp = row.get("timestamp")
+        download_mbps = row.get("download_mbps")
+
+        if pd.isna(timestamp) or pd.isna(download_mbps):
+            current_streak = 0
+            continue
+
+        hour = timestamp.hour
+
+        if not (active_start_hour <= hour < active_end_hour):
+            current_streak = 0
+            continue
+
+        try:
+            download_value = float(download_mbps)
+        except (TypeError, ValueError):
+            current_streak = 0
+            continue
+
+        if download_value < threshold_mbps:
+            current_streak += 1
+            max_streak = max(max_streak, current_streak)
+        else:
+            current_streak = 0
+
+    return {
+        "current_streak": current_streak,
+        "max_streak": max_streak,
+    }
+
+
+def generate_html_report(
+    csv_file: Path,
+    html_file: Path,
+    recent_hours: int = DEFAULT_RECENT_HOURS,
+    alert_min_download: float = DEFAULT_ALERT_MIN_DOWNLOAD,
+    alert_consecutive_low: int = DEFAULT_ALERT_CONSECUTIVE_LOW,
+    alert_active_start: int = DEFAULT_ALERT_ACTIVE_START,
+    alert_active_end: int = DEFAULT_ALERT_ACTIVE_END,
+) -> bool:
     ensure_csv_exists(csv_file)
     html_file.parent.mkdir(parents=True, exist_ok=True)
 
     df = pd.read_csv(csv_file)
+    alert_triggered = False
 
     if df.empty:
         body = "<p>No data yet.</p>"
@@ -292,7 +374,34 @@ def generate_html_report(csv_file: Path, html_file: Path) -> None:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
         ok_df = df[df["error"].fillna("") == ""].copy()
-        stats = build_download_stats(ok_df)
+        overall_stats = build_download_stats(ok_df)
+
+        recent_df = filter_last_hours(ok_df, recent_hours)
+        recent_stats = build_download_stats(recent_df)
+        recent_below_threshold = count_download_below_threshold(
+            recent_df,
+            alert_min_download,
+        )
+
+        all_streaks = calculate_low_download_streaks(
+            ok_df,
+            threshold_mbps=alert_min_download,
+            active_start_hour=alert_active_start,
+            active_end_hour=alert_active_end,
+        )
+        recent_streaks = calculate_low_download_streaks(
+            recent_df,
+            threshold_mbps=alert_min_download,
+            active_start_hour=alert_active_start,
+            active_end_hour=alert_active_end,
+        )
+
+        current_low_streak = all_streaks["current_streak"]
+        recent_max_low_streak = recent_streaks["max_streak"]
+        alert_triggered = current_low_streak > alert_consecutive_low
+
+        alert_status = "ALERT" if alert_triggered else "OK"
+        alert_card_class = "card alert-card" if alert_triggered else "card"
 
         if ok_df.empty:
             graph_html = "<p>No successful speed tests yet.</p>"
@@ -339,6 +448,7 @@ def generate_html_report(csv_file: Path, html_file: Path) -> None:
                 legend=dict(orientation="h"),
                 hovermode="x unified",
                 template="plotly_white",
+                margin=dict(l=40, r=40, t=60, b=40),
             )
 
             graph_html = plot(
@@ -357,9 +467,9 @@ def generate_html_report(csv_file: Path, html_file: Path) -> None:
         prompt_text = html.escape(build_analysis_prompt(csv_file))
 
         body = f"""
-        <section class="summary">
-            <h2>Summary</h2>
-            <div class="cards">
+        <section>
+            <h2>Total Measurements</h2>
+            <div class="cards cards-compact">
                 <div class="card">
                     <div class="label">Total saved tests</div>
                     <div class="value">{total_tests}</div>
@@ -374,35 +484,86 @@ def generate_html_report(csv_file: Path, html_file: Path) -> None:
                 </div>
                 <div class="card">
                     <div class="label">Download samples</div>
-                    <div class="value">{stats["samples"]}</div>
+                    <div class="value">{overall_stats["samples"]}</div>
                 </div>
             </div>
         </section>
 
         <section>
-            <h2>Download Statistics</h2>
+            <h2>Overall Download Statistics</h2>
             <div class="cards">
                 <div class="card">
                     <div class="label">Average download</div>
-                    <div class="value">{stats["average"]} Mbps</div>
+                    <div class="value">{overall_stats["average"]} Mbps</div>
                 </div>
                 <div class="card">
                     <div class="label">Median download</div>
-                    <div class="value">{stats["median"]} Mbps</div>
+                    <div class="value">{overall_stats["median"]} Mbps</div>
                 </div>
                 <div class="card">
                     <div class="label">Minimum download</div>
-                    <div class="value">{stats["minimum"]} Mbps</div>
+                    <div class="value">{overall_stats["minimum"]} Mbps</div>
                 </div>
                 <div class="card">
                     <div class="label">Maximum download</div>
-                    <div class="value">{stats["maximum"]} Mbps</div>
+                    <div class="value">{overall_stats["maximum"]} Mbps</div>
                 </div>
                 <div class="card">
                     <div class="label">Latest download</div>
-                    <div class="value">{stats["latest"]} Mbps</div>
+                    <div class="value">{overall_stats["latest"]} Mbps</div>
                 </div>
             </div>
+        </section>
+
+        <section>
+            <h2>Last {recent_hours} Hours</h2>
+            <div class="cards">
+                <div class="card">
+                    <div class="label">Successful samples</div>
+                    <div class="value">{recent_stats["samples"]}</div>
+                </div>
+                <div class="card">
+                    <div class="label">Average download</div>
+                    <div class="value">{recent_stats["average"]} Mbps</div>
+                </div>
+                <div class="card">
+                    <div class="label">Median download</div>
+                    <div class="value">{recent_stats["median"]} Mbps</div>
+                </div>
+                <div class="card">
+                    <div class="label">Minimum download</div>
+                    <div class="value">{recent_stats["minimum"]} Mbps</div>
+                </div>
+                <div class="card">
+                    <div class="label">Maximum download</div>
+                    <div class="value">{recent_stats["maximum"]} Mbps</div>
+                </div>
+                <div class="card">
+                    <div class="label">Latest download</div>
+                    <div class="value">{recent_stats["latest"]} Mbps</div>
+                </div>
+                <div class="card">
+                    <div class="label">Below {format_number(alert_min_download, 0)} Mbps</div>
+                    <div class="value">{recent_below_threshold}</div>
+                </div>
+                <div class="card">
+                    <div class="label">Max low streak in period</div>
+                    <div class="value">{recent_max_low_streak}</div>
+                </div>
+                <div class="card">
+                    <div class="label">Current low streak</div>
+                    <div class="value">{current_low_streak}</div>
+                </div>
+                <div class="{alert_card_class}">
+                    <div class="label">Low-speed alert</div>
+                    <div class="value">{alert_status}</div>
+                </div>
+            </div>
+            <p class="note">
+                Alert rule: more than {alert_consecutive_low} consecutive successful measurements
+                below {format_number(alert_min_download, 0)} Mbps between
+                {alert_active_start:02d}:00 and {alert_active_end:02d}:00.
+            </p>
         </section>
 
         <section>
@@ -431,66 +592,97 @@ def generate_html_report(csv_file: Path, html_file: Path) -> None:
     <style>
         body {{
             font-family: Arial, sans-serif;
-            margin: 32px;
+            margin: 18px;
             background: #f7f7f7;
             color: #222;
         }}
 
-        h1, h2 {{
+        h1 {{
             color: #111;
+            font-size: 26px;
+            margin: 0 0 14px 0;
+        }}
+
+        h2 {{
+            color: #111;
+            font-size: 20px;
+            margin: 0 0 16px 0;
+        }}
+
+        p {{
+            font-size: 14px;
+            margin: 0 0 14px 0;
         }}
 
         section {{
             background: #fff;
-            padding: 24px;
-            margin-bottom: 24px;
-            border-radius: 14px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+            padding: 16px;
+            margin-bottom: 16px;
+            border-radius: 10px;
+            box-shadow: 0 1px 8px rgba(0,0,0,0.07);
         }}
 
         .cards {{
-            display: flex;
-            gap: 16px;
-            flex-wrap: wrap;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 12px;
+            align-items: stretch;
+        }}
+
+        .cards-compact {{
+            grid-template-columns: repeat(auto-fit, minmax(140px, 180px));
         }}
 
         .card {{
             background: #f1f1f1;
-            padding: 18px;
-            border-radius: 12px;
-            min-width: 180px;
+            padding: 12px;
+            border-radius: 9px;
+            min-width: 0;
+        }}
+
+        .alert-card {{
+            background: #ffe0e0;
         }}
 
         .label {{
-            font-size: 14px;
+            font-size: 12px;
             color: #555;
+            line-height: 1.25;
         }}
 
         .value {{
-            font-size: 28px;
+            font-size: 22px;
             font-weight: bold;
-            margin-top: 8px;
+            margin-top: 6px;
+            line-height: 1.15;
+            white-space: nowrap;
+        }}
+
+        .note {{
+            margin: 14px 0 0 0;
+            color: #555;
+            font-size: 12px;
         }}
 
         textarea {{
             width: 100%;
-            min-height: 260px;
+            min-height: 220px;
             font-family: Consolas, monospace;
-            font-size: 14px;
-            padding: 14px;
+            font-size: 13px;
+            padding: 12px;
             box-sizing: border-box;
         }}
 
         .data-table {{
             border-collapse: collapse;
             width: 100%;
-            font-size: 14px;
+            font-size: 13px;
         }}
 
         .data-table th,
         .data-table td {{
             border-bottom: 1px solid #ddd;
-            padding: 8px;
+            padding: 6px;
             text-align: left;
         }}
 
@@ -508,6 +700,7 @@ def generate_html_report(csv_file: Path, html_file: Path) -> None:
 """
 
     html_file.write_text(html_content, encoding="utf-8")
+    return alert_triggered
 
 
 def main() -> None:
@@ -566,6 +759,53 @@ def main() -> None:
         ),
     )
 
+    parser.add_argument(
+        "--recent-hours",
+        type=int,
+        default=DEFAULT_RECENT_HOURS,
+        help=f"Recent-hours window for the report. Default: {DEFAULT_RECENT_HOURS}.",
+    )
+
+    parser.add_argument(
+        "--alert-min-download",
+        type=float,
+        default=DEFAULT_ALERT_MIN_DOWNLOAD,
+        help=(
+            "Low download threshold for report indicators. "
+            f"Default: {DEFAULT_ALERT_MIN_DOWNLOAD} Mbps."
+        ),
+    )
+
+    parser.add_argument(
+        "--alert-consecutive-low",
+        type=int,
+        default=DEFAULT_ALERT_CONSECUTIVE_LOW,
+        help=(
+            "Alert when the current low-download streak is greater than this value. "
+            f"Default: {DEFAULT_ALERT_CONSECUTIVE_LOW}."
+        ),
+    )
+
+    parser.add_argument(
+        "--alert-active-start",
+        type=int,
+        default=DEFAULT_ALERT_ACTIVE_START,
+        help=(
+            "Active alert window start hour, inclusive. "
+            f"Default: {DEFAULT_ALERT_ACTIVE_START}."
+        ),
+    )
+
+    parser.add_argument(
+        "--alert-active-end",
+        type=int,
+        default=DEFAULT_ALERT_ACTIVE_END,
+        help=(
+            "Active alert window end hour, exclusive. "
+            f"Default: {DEFAULT_ALERT_ACTIVE_END}."
+        ),
+    )
+
     args = parser.parse_args()
 
     MIN_DOWNLOAD_MBPS = args.min_download
@@ -584,7 +824,15 @@ def main() -> None:
         )
 
         append_result(csv_file, result)
-        generate_html_report(csv_file, html_file)
+        alert_triggered = generate_html_report(
+            csv_file,
+            html_file,
+            recent_hours=args.recent_hours,
+            alert_min_download=args.alert_min_download,
+            alert_consecutive_low=args.alert_consecutive_low,
+            alert_active_start=args.alert_active_start,
+            alert_active_end=args.alert_active_end,
+        )
 
         if result["error"]:
             log(f"Final saved result failed: {result['error']}")
@@ -595,6 +843,13 @@ def main() -> None:
                 f"upload={result['upload_mbps']} Mbps, "
                 f"ping={result['ping_ms']} ms, "
                 f"server={result['server_sponsor']} / {result['server_name']}"
+            )
+
+        if alert_triggered:
+            log(
+                "LOW SPEED ALERT: current low-download streak is greater than "
+                f"{args.alert_consecutive_low}; threshold={args.alert_min_download} Mbps; "
+                f"active window={args.alert_active_start:02d}:00-{args.alert_active_end:02d}:00"
             )
 
         log(f"Report updated: {html_file}")
